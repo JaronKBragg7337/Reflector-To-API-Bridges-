@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""
+REFLECTOR → AETHERSPAN BRIDGE ADAPTER (COMPATIBLE WITH AETHERSPAN v1.1)
+
+What this file DOES:
+- Connects to an existing AETHERSPAN WebSocket endpoint.
+- Accepts "code-like" strings (your domain example) and converts them into AETHERSPAN frames.
+- Sends frames to AETHERSPAN and returns its {ok,state,receipt} response.
+- Does NOT modify AETHERSPAN.
+
+Dependency:
+  pip install websockets
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import ast
+import json
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+import websockets
+
+
+# ----------------------------
+# Small helpers
+# ----------------------------
+
+def jdump(x: Any) -> str:
+    return json.dumps(x, ensure_ascii=False, default=str)
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+def _float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+# ----------------------------
+# AETHERSPAN WebSocket client
+# ----------------------------
+
+@dataclass
+class AetherspanResponse:
+    ok: bool
+    reason: Optional[str]
+    state: Dict[str, Any]
+    receipt: Dict[str, Any]
+    raw: Dict[str, Any]
+    rtt_ms: float
+
+
+class AetherspanWSClient:
+    def __init__(self, ws_url: str, *, reconnect: bool = True, timeout_s: float = 5.0):
+        self.ws_url = ws_url
+        self.reconnect = reconnect
+        self.timeout_s = timeout_s
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+
+    async def connect(self) -> None:
+        if self._ws and not self._ws.closed:
+            return
+        self._ws = await websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20)
+
+    async def close(self) -> None:
+        if self._ws:
+            try:
+                await self._ws.close()
+            finally:
+                self._ws = None
+
+    async def send_frame(self, frame: Dict[str, Any]) -> AetherspanResponse:
+        started = time.perf_counter()
+        try:
+            await self.connect()
+            assert self._ws is not None
+            await asyncio.wait_for(self._ws.send(jdump(frame)), timeout=self.timeout_s)
+            msg = await asyncio.wait_for(self._ws.recv(), timeout=self.timeout_s)
+            raw = json.loads(msg)
+        except Exception as e:
+            if self.reconnect:
+                await self.close()
+            rtt = (time.perf_counter() - started) * 1000.0
+            return AetherspanResponse(
+                ok=False,
+                reason=str(e),
+                state={},
+                receipt={"error": str(e)},
+                raw={"ok": False, "reason": str(e)},
+                rtt_ms=rtt,
+            )
+
+        rtt = (time.perf_counter() - started) * 1000.0
+        return AetherspanResponse(
+            ok=bool(raw.get("ok", False)),
+            reason=raw.get("reason"),
+            state=raw.get("state") or {},
+            receipt=raw.get("receipt") or {},
+            raw=raw,
+            rtt_ms=rtt,
+        )
+
+
+# ----------------------------
+# Parser: "domain code" -> teleop/device_cmd frames
+# ----------------------------
+
+class ReflectorCommandParser:
+    """
+    Converts simple code strings into one or more AETHERSPAN frames.
+
+    Supported inputs (examples):
+
+    1) robot.move(x=0.5, y=0.0, yaw=-0.1, pitch=0.0)
+    2) robot.drive(vx=0.5, vy=0.0, wyaw=-0.1, pitch=0.0)
+    3) device_cmd = {"vx":0.6,"vy":0.0,"wyaw":0.1,"mode":"teleop"}
+       (or just a dict literal in the code)
+    4) vx = 0.4; vy = 0.0; wyaw = -0.1; pitch = 0.0   (single command)
+    """
+
+    def __init__(self):
+        self.last_vars: Dict[str, Any] = {}
+
+    def parse(self, code: str) -> List[Dict[str, Any]]:
+        code = (code or "").strip()
+        if not code:
+            return []
+
+        # Fast path: if the whole thing is JSON dict
+        if code.startswith("{") and code.endswith("}"):
+            try:
+                obj = json.loads(code)
+                f = self._frame_from_obj(obj)
+                return [f] if f else []
+            except Exception:
+                pass
+
+        # AST parse
+        try:
+            tree = ast.parse(code)
+        except Exception:
+            return []
+
+        frames: List[Dict[str, Any]] = []
+
+        # Track simple assignments so "vx=..." style works
+        assigns: Dict[str, Any] = {}
+
+        for node in tree.body:
+            # assignments: vx = 0.5, device_cmd = {...}
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+                val = self._safe_eval(node.value)
+                assigns[name] = val
+                self.last_vars[name] = val
+                continue
+
+            # expression calls: robot.move(...), robot.drive(...)
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                f = self._frame_from_call(node.value)
+                if f:
+                    frames.append(f)
+                continue
+
+        # If there is a device_cmd assignment, prefer that
+        if "device_cmd" in assigns and isinstance(assigns["device_cmd"], dict):
+            f = self._frame_from_obj({"device_cmd": assigns["device_cmd"]})
+            if f:
+                frames.append(f)
+
+        # If there are vx/vy/wyaw-style assigns, build one command
+        if any(k in assigns for k in ("vx", "vy", "wyaw", "pitch", "grip_L", "grip_R")):
+            cmd = {
+                "vx": _float(assigns.get("vx", 0.0)),
+                "vy": _float(assigns.get("vy", 0.0)),
+                "wyaw": _float(assigns.get("wyaw", 0.0)),
+                "pitch": _float(assigns.get("pitch", 0.0)),
+                "grip_L": _float(assigns.get("grip_L", 0.0)),
+                "grip_R": _float(assigns.get("grip_R", 0.0)),
+                "mode": "teleop",
+            }
+            frames.append({"device_cmd": cmd})
+
+        # Also support a dict literal assigned to "teleop" or "robot_cmd"
+        for k in ("teleop", "robot_cmd"):
+            if k in assigns and isinstance(assigns[k], dict):
+                f = self._frame_from_obj(assigns[k])
+                if f:
+                    frames.append(f)
+
+        # De-dupe empties
+        out = [f for f in frames if isinstance(f, dict) and f]
+        return out
+
+    def _frame_from_call(self, call: ast.Call) -> Optional[Dict[str, Any]]:
+        # robot.move(...) or robot.drive(...)
+        fn = call.func
+        if not isinstance(fn, ast.Attribute):
+            return None
+        if not isinstance(fn.value, ast.Name):
+            return None
+        if fn.value.id != "robot":
+            return None
+
+        name = fn.attr
+        kwargs = {}
+        for kw in call.keywords:
+            if kw.arg is None:
+                continue
+            kwargs[kw.arg] = self._safe_eval(kw.value)
+
+        if name == "move":
+            # move(x,y,yaw,pitch,grip_L,grip_R)
+            cmd = {
+                "vx": _float(kwargs.get("x", 0.0)),
+                "vy": _float(kwargs.get("y", 0.0)),
+                "wyaw": _float(kwargs.get("yaw", 0.0)),
+                "pitch": _float(kwargs.get("pitch", 0.0)),
+                "grip_L": _float(kwargs.get("grip_L", 0.0)),
+                "grip_R": _float(kwargs.get("grip_R", 0.0)),
+                "mode": "teleop",
+            }
+            return {"device_cmd": cmd}
+
+        if name == "drive":
+            # drive(vx,vy,wyaw,pitch,grip_L,grip_R)
+            cmd = {
+                "vx": _float(kwargs.get("vx", 0.0)),
+                "vy": _float(kwargs.get("vy", 0.0)),
+                "wyaw": _float(kwargs.get("wyaw", 0.0)),
+                "pitch": _float(kwargs.get("pitch", 0.0)),
+                "grip_L": _float(kwargs.get("grip_L", 0.0)),
+                "grip_R": _float(kwargs.get("grip_R", 0.0)),
+                "mode": "teleop",
+            }
+            return {"device_cmd": cmd}
+
+        return None
+
+    def _frame_from_obj(self, obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(obj, dict):
+            return None
+
+        # If already in AETHERSPAN format
+        if "device_cmd" in obj and isinstance(obj["device_cmd"], dict):
+            return {"device_cmd": self._normalize_device_cmd(obj["device_cmd"])}
+
+        # If it's a plain command dict, treat it as device_cmd
+        if any(k in obj for k in ("vx", "vy", "wyaw", "pitch", "mode", "grip_L", "grip_R")):
+            return {"device_cmd": self._normalize_device_cmd(obj)}
+
+        # If wrapped
+        if "teleop" in obj and isinstance(obj["teleop"], dict):
+            return self._frame_from_obj(obj["teleop"])
+        if "robot_cmd" in obj and isinstance(obj["robot_cmd"], dict):
+            return self._frame_from_obj(obj["robot_cmd"])
+
+        return None
+
+    def _normalize_device_cmd(self, cmd: Dict[str, Any]) -> Dict[str, Any]:
+        # enforce numeric ranges lightly
+        out = dict(cmd)
+        out["vx"] = clamp(_float(out.get("vx", 0.0)), -1.0, 1.0)
+        out["vy"] = clamp(_float(out.get("vy", 0.0)), -1.0, 1.0)
+        out["wyaw"] = clamp(_float(out.get("wyaw", 0.0)), -2.0, 2.0)
+        out["pitch"] = clamp(_float(out.get("pitch", 0.0)), -1.0, 1.0)
+        out["grip_L"] = clamp(_float(out.get("grip_L", 0.0)), 0.0, 1.0)
+        out["grip_R"] = clamp(_float(out.get("grip_R", 0.0)), 0.0, 1.0)
+        out["mode"] = str(out.get("mode", "teleop"))
+        return out
+
+    def _safe_eval(self, node: ast.AST) -> Any:
+        # very small safe evaluator for literals/dicts/lists/numbers/strings/bools/None
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Num):  # py<3.8
+            return node.n
+        if isinstance(node, ast.Str):  # py<3.8
+            return node.s
+        if isinstance(node, ast.NameConstant):  # py<3.8
+            return node.value
+        if isinstance(node, ast.Dict):
+            keys = [self._safe_eval(k) for k in node.keys]
+            vals = [self._safe_eval(v) for v in node.values]
+            try:
+                return dict(zip(keys, vals))
+            except Exception:
+                return {}
+        if isinstance(node, ast.List):
+            return [self._safe_eval(e) for e in node.elts]
+        if isinstance(node, ast.Tuple):
+            return [self._safe_eval(e) for e in node.elts]
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            v = self._safe_eval(node.operand)
+            if isinstance(v, (int, float)):
+                return -v if isinstance(node.op, ast.USub) else v
+        if isinstance(node, ast.Name):
+            # allow using previously assigned vars
+            return self.last_vars.get(node.id)
+        return None
+
+
+# ----------------------------
+# Adapter: the thing you actually use
+# ----------------------------
+
+class ReflectorToAetherspanAdapter:
+    """
+    This is the ONLY bridge point.
+    It turns domain text -> AETHERSPAN WS frames -> returns AETHERSPAN result.
+    """
+
+    def __init__(self, ws_url: str, *, account_id: Optional[str] = None):
+        self.client = AetherspanWSClient(ws_url)
+        self.parser = ReflectorCommandParser()
+        self.account_id = account_id  # optional; helps if billing is enabled
+
+    async def connect(self) -> None:
+        await self.client.connect()
+
+    async def close(self) -> None:
+        await self.client.close()
+
+    async def send_code(self, code: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        context = context or {}
+        frames = self.parser.parse(code)
+
+        if not frames:
+            return {
+                "ok": False,
+                "reason": "no_robot_command_found",
+                "frames_sent": 0,
+                "results": [],
+            }
+
+        results = []
+        for f in frames:
+            # attach account_id if provided (billing-friendly)
+            if self.account_id:
+                f = dict(f)
+                f["account_id"] = self.account_id
+
+            resp = await self.client.send_frame(f)
+            results.append(
+                {
+                    "frame": f,
+                    "ok": resp.ok,
+                    "reason": resp.reason,
+                    "state": resp.state,
+                    "receipt": resp.receipt,
+                    "rtt_ms": resp.rtt_ms,
+                    "raw": resp.raw,
+                }
+            )
+
+        return {
+            "ok": all(r["ok"] for r in results),
+            "frames_sent": len(results),
+            "results": results,
+        }
+
+
+# ----------------------------
+# CLI (so you can verify it actually works)
+# ----------------------------
+
+async def run_demo(adapter: ReflectorToAetherspanAdapter) -> None:
+    await adapter.connect()
+
+    samples = [
+        "robot.move(x=0.5, y=0.0, yaw=0.0)",
+        "robot.drive(vx=0.0, vy=0.3, wyaw=-0.2)",
+        '{"device_cmd":{"vx":0.2,"vy":0.0,"wyaw":0.0,"mode":"teleop"}}',
+        "vx = 0.4\nvy = 0.0\nwyaw = 0.1",
+    ]
+
+    for s in samples:
+        out = await adapter.send_code(s)
+        last = out["results"][-1]
+        print("\nCODE:\n", s)
+        print("OK:", out["ok"], "frames_sent:", out["frames_sent"])
+        print("RTT(ms):", round(last["rtt_ms"], 2))
+        print("STATE:", last["state"])
+        print("REASON:", last["reason"])
+
+    await adapter.close()
+
+
+async def run_stdin(adapter: ReflectorToAetherspanAdapter) -> None:
+    await adapter.connect()
+    print("Enter commands. Examples:")
+    print("  robot.move(x=0.5,y=0.0,yaw=0.1)")
+    print("  robot.drive(vx=0.2,vy=0.0,wyaw=-0.1)")
+    print('  {"device_cmd":{"vx":0.2,"vy":0.0,"wyaw":0.0,"mode":"teleop"}}')
+    print("  vx=0.4  (not supported inline), use:\n    vx = 0.4\n    vy = 0.0\n    wyaw = 0.0\n")
+    print("Ctrl+C to exit.\n")
+
+    try:
+        while True:
+            code = input("> ")
+            out = await adapter.send_code(code)
+            print(jdump(out))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await adapter.close()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ws", default="ws://localhost:8000/ws/teleop/reflector_bot")
+    ap.add_argument("--account", default=None, help="Optional account_id for AETHERSPAN billing")
+    ap.add_argument("--demo", action="store_true")
+    ap.add_argument("--stdin", action="store_true")
+    args = ap.parse_args()
+
+    adapter = ReflectorToAetherspanAdapter(args.ws, account_id=args.account)
+
+    if args.demo:
+        asyncio.run(run_demo(adapter))
+    else:
+        asyncio.run(run_stdin(adapter) if args.stdin else run_demo(adapter))
+
+
+if __name__ == "__main__":
+    main()
